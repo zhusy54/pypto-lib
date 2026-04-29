@@ -65,16 +65,22 @@ def build_wse_ffn_program(
     @pl.program
     class WseFFN:
         # ------------------------------------------------------------------
-        # Step 1a: gate projection + SiLU(gate)  →  FP32 gate_silu (in output)
+        # Merged Step 1: gate matmul + up matmul + SiLU + mul + cast → BF16
+        # Two sequential matmul tpop chains separated by pl.store(GM) which
+        # is the only path that triggers tpop+tfree, freeing L0C for chain 2.
         # ------------------------------------------------------------------
         @pl.function(type=pl.FunctionType.InCore)
-        def kernel_gate_silu(
+        def kernel_gate_up_silu_mul(
             self,
             x: pl.Tensor[[BATCH_TILE, HIDDEN_SIZE], pl.BF16],
             w_gate: pl.Tensor[[HIDDEN_SIZE, INTER_SIZE], pl.BF16],
+            w_up: pl.Tensor[[HIDDEN_SIZE, INTER_SIZE], pl.BF16],
             o0: pl.Scalar[pl.INDEX],
-            output: pl.Out[pl.Tensor[[BATCH_TILE, FFN_OUT_CHUNK], pl.FP32]],
-        ) -> pl.Tensor[[BATCH_TILE, FFN_OUT_CHUNK], pl.FP32]:
+            gate_buf: pl.Out[pl.Tensor[[BATCH_TILE, FFN_OUT_CHUNK], pl.FP32]],
+            up_buf: pl.Out[pl.Tensor[[BATCH_TILE, FFN_OUT_CHUNK], pl.FP32]],
+            ffn_batch: pl.InOut[pl.Tensor[[BATCH_TILE, INTER_SIZE], pl.BF16]],
+        ) -> pl.Tensor[[BATCH_TILE, INTER_SIZE], pl.BF16]:
+            # Chain 1: gate matmul → L0C
             x0 = pl.load(x, [0, 0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Mat)
             wg0 = pl.load(w_gate, [0, o0], [K_CHUNK, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Mat)
             gate_acc = pl.matmul(x0, wg0)
@@ -83,48 +89,27 @@ def build_wse_ffn_program(
                 xi = pl.load(x, [0, k0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Mat)
                 wg = pl.load(w_gate, [k0, o0], [K_CHUNK, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Mat)
                 gate_acc = pl.matmul_acc(gate_acc, xi, wg)
-            # Store gate_acc to GM (use+free gate tpop chain), reload into Vec for SiLU.
-            gate_stored = pl.store(gate_acc, [0, 0], output)
-            gate_vec = pl.load(gate_stored, [0, 0], [BATCH_TILE, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Vec)
-            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_vec)), 1.0))
-            gate_silu = pl.mul(gate_vec, sigmoid)
-            # Overwrite output with gate_silu (same FP32 buffer).
-            out = pl.store(gate_silu, [0, 0], gate_stored)
-            return out
+            # tpop+tfree chain 1 (L0C released)
+            gate_stored = pl.store(gate_acc, [0, 0], gate_buf)
 
-        # ------------------------------------------------------------------
-        # Step 1b: up projection + gate_silu * up  →  BF16 written at [0,o0]
-        # gate_silu is a plain input parameter (not tainted by any tpop here).
-        # Writes the BF16 result directly into ffn_batch at offset [0, o0] to
-        # avoid a FP32/BF16 type conflict: if a separate ffn_buf (BF16) were
-        # used and then assembled into ffn_batch, the compiler would attempt to
-        # alias the FP32 up_buf and BF16 ffn_buf onto the same ffn_batch memory
-        # region, causing incorrect strides and data corruption.
-        # ------------------------------------------------------------------
-        @pl.function(type=pl.FunctionType.InCore)
-        def kernel_up_mul(
-            self,
-            x: pl.Tensor[[BATCH_TILE, HIDDEN_SIZE], pl.BF16],
-            w_up: pl.Tensor[[HIDDEN_SIZE, INTER_SIZE], pl.BF16],
-            gate_silu: pl.Tensor[[BATCH_TILE, FFN_OUT_CHUNK], pl.FP32],
-            o0: pl.Scalar[pl.INDEX],
-            up_buf: pl.Out[pl.Tensor[[BATCH_TILE, FFN_OUT_CHUNK], pl.FP32]],
-            ffn_batch: pl.InOut[pl.Tensor[[BATCH_TILE, INTER_SIZE], pl.BF16]],
-        ) -> pl.Tensor[[BATCH_TILE, INTER_SIZE], pl.BF16]:
-            x0 = pl.load(x, [0, 0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Mat)
+            # Chain 2: up matmul → L0C (now reusable)
+            x1 = pl.load(x, [0, 0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Mat)
             wu0 = pl.load(w_up, [0, o0], [K_CHUNK, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Mat)
-            up_acc = pl.matmul(x0, wu0)
+            up_acc = pl.matmul(x1, wu0)
             for kb in pl.range(1, HIDDEN_BLOCKS):
                 k0 = kb * K_CHUNK
-                xi = pl.load(x, [0, k0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Mat)
+                xj = pl.load(x, [0, k0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Mat)
                 wu = pl.load(w_up, [k0, o0], [K_CHUNK, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Mat)
-                up_acc = pl.matmul_acc(up_acc, xi, wu)
-            # Store up_acc to GM (use+free up tpop chain), reload both into Vec for mul.
+                up_acc = pl.matmul_acc(up_acc, xj, wu)
+            # tpop+tfree chain 2
             up_stored = pl.store(up_acc, [0, 0], up_buf)
-            gate_silu_vec = pl.load(gate_silu, [0, 0], [BATCH_TILE, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Vec)
+
+            # Vec compute: SiLU(gate) * up → BF16 → store at [0, o0]
+            gate_vec = pl.load(gate_stored, [0, 0], [BATCH_TILE, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Vec)
             up_vec = pl.load(up_stored, [0, 0], [BATCH_TILE, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Vec)
-            # Multiply, cast to BF16, store directly into ffn_batch at [0, o0].
-            ffn_chunk = pl.mul(gate_silu_vec, up_vec)
+            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_vec)), 1.0))
+            gate_silu = pl.mul(gate_vec, sigmoid)
+            ffn_chunk = pl.mul(gate_silu, up_vec)
             ffn_bf16 = pl.cast(ffn_chunk, target_type=pl.BF16)
             out = pl.store(ffn_bf16, [0, o0], ffn_batch)
             return out
@@ -170,15 +155,14 @@ def build_wse_ffn_program(
                 x_batch = pl.slice(post_norm, [BATCH_TILE, HIDDEN_SIZE], [b0, 0])
                 ffn_batch = pl.create_tensor([BATCH_TILE, INTER_SIZE], dtype=pl.BF16)
 
-                # Step 1: gate_silu then up_mul, chunked over FFN_OUT_CHUNK.
-                # kernel_up_mul writes BF16 result directly into ffn_batch at [0, o0],
-                # avoiding a separate ffn_buf alloc and pl.assemble.
+                # Step 1: merged gate + up + SiLU + mul, chunked over FFN_OUT_CHUNK.
                 for ob in pl.range(FFN_OUT_BLOCKS):
                     o0 = ob * FFN_OUT_CHUNK
-                    gate_silu_buf = pl.create_tensor([BATCH_TILE, FFN_OUT_CHUNK], dtype=pl.FP32)
-                    gate_silu = self.kernel_gate_silu(x_batch, w_gate, o0, gate_silu_buf)
+                    gate_buf = pl.create_tensor([BATCH_TILE, FFN_OUT_CHUNK], dtype=pl.FP32)
                     up_buf = pl.create_tensor([BATCH_TILE, FFN_OUT_CHUNK], dtype=pl.FP32)
-                    ffn_batch = self.kernel_up_mul(x_batch, w_up, gate_silu, o0, up_buf, ffn_batch)
+                    ffn_batch = self.kernel_gate_up_silu_mul(
+                        x_batch, w_gate, w_up, o0, gate_buf, up_buf, ffn_batch
+                    )
 
                 # Step 2: down projection + FP32 store, chunked over K_CHUNK / hidden dim.
                 for dob in pl.range(HIDDEN_BLOCKS):
