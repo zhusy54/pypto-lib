@@ -124,7 +124,6 @@ def build_wse_ffn_program(
             w_down: pl.Tensor[[INTER_SIZE, HIDDEN_SIZE], pl.BF16],
             b0: pl.Scalar[pl.INDEX],
             d0: pl.Scalar[pl.INDEX],
-            down_buf: pl.Out[pl.Tensor[[BATCH_TILE, K_CHUNK], pl.FP32]],
             out: pl.Out[pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.FP32]],
         ) -> pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.FP32]:
             # Down projection: ffn_tile @ W_down[:,d0:d0+K_CHUNK]
@@ -137,9 +136,7 @@ def build_wse_ffn_program(
                 wd_i = pl.load(w_down, [o0, d0], [FFN_OUT_CHUNK, K_CHUNK], target_memory=pl.MemorySpace.Mat)
                 acc = pl.matmul_acc(acc, ffn_i, wd_i)
             # Store acc to GM (use+free down tpop chain), reload into Vec, store FP32.
-            down_stored = pl.store(acc, [0, 0], down_buf)
-            down_vec = pl.load(down_stored, [0, 0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Vec)
-            result = pl.store(down_vec, [b0, d0], out)
+            result = pl.store(acc, [b0, d0], out)
             return result
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -167,8 +164,7 @@ def build_wse_ffn_program(
                 # Step 2: down projection + FP32 store, chunked over K_CHUNK / hidden dim.
                 for dob in pl.range(HIDDEN_BLOCKS):
                     d0 = dob * K_CHUNK
-                    down_buf = pl.create_tensor([BATCH_TILE, K_CHUNK], dtype=pl.FP32)
-                    out = self.kernel_down(ffn_batch, w_down, b0, d0, down_buf, out)
+                    out = self.kernel_down(ffn_batch, w_down, b0, d0, out)
 
             return out
 
