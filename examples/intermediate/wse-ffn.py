@@ -55,27 +55,28 @@ def build_wse_ffn_program(
             out: pl.Out[pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.FP32]],
         ) -> pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.FP32]:
             # ── Phase 1: gate + up + SiLU + mul → BF16 ffn_batch ──────────
+            x_full = pl.load(x, [0, 0], [BATCH_TILE, HIDDEN_SIZE], target_memory=pl.MemorySpace.Mat)
             for ob in pl.range(FFN_OUT_BLOCKS):
                 o0 = ob * FFN_OUT_CHUNK
 
                 # Chain: gate matmul → L0C → store GM → load Vec
-                x0 = pl.load(x, [0, 0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Mat)
+                x0 = pl.slice(x_full, [BATCH_TILE, K_CHUNK], [0, 0])
                 wg0 = pl.load(w_gate, [0, o0], [K_CHUNK, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Mat)
                 gate_acc = pl.matmul(x0, wg0)
                 for kb in pl.range(1, HIDDEN_BLOCKS):
                     k0 = kb * K_CHUNK
-                    xi = pl.load(x, [0, k0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Mat)
+                    xi = pl.slice(x_full, [BATCH_TILE, K_CHUNK], [0, k0])
                     wg = pl.load(w_gate, [k0, o0], [K_CHUNK, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Mat)
                     gate_acc = pl.matmul_acc(gate_acc, xi, wg)
                 gate_vec = pl.move(gate_acc, target_memory=pl.MemorySpace.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
 
                 # Chain: up matmul → L0C → store GM → load Vec
-                x1 = pl.load(x, [0, 0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Mat)
+                x1 = pl.slice(x_full, [BATCH_TILE, K_CHUNK], [0, 0])
                 wu0 = pl.load(w_up, [0, o0], [K_CHUNK, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Mat)
                 up_acc = pl.matmul(x1, wu0)
                 for kb in pl.range(1, HIDDEN_BLOCKS):
                     k0 = kb * K_CHUNK
-                    xj = pl.load(x, [0, k0], [BATCH_TILE, K_CHUNK], target_memory=pl.MemorySpace.Mat)
+                    xj = pl.slice(x_full, [BATCH_TILE, K_CHUNK], [0, k0])
                     wu = pl.load(w_up, [k0, o0], [K_CHUNK, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Mat)
                     up_acc = pl.matmul_acc(up_acc, xj, wu)
 
@@ -88,16 +89,18 @@ def build_wse_ffn_program(
                 ffn_batch = pl.store(ffn_bf16, [0, o0], ffn_batch)
 
             # ── Phase 2: down projection → FP32 output ────────────────────
+            # Load full ffn_batch once (16×3072 BF16 = 96KB < L1 512KB limit); ob loops only slice.
+            ffn_full = pl.load(ffn_batch, [0, 0], [BATCH_TILE, INTER_SIZE], target_memory=pl.MemorySpace.Mat)
             for dob in pl.range(HIDDEN_BLOCKS):
                 d0 = dob * K_CHUNK
 
                 # Chain: down matmul → L0C → store GM → load Vec → store FP32
-                ffn0 = pl.load(ffn_batch, [0, 0], [BATCH_TILE, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Mat)
+                ffn0 = pl.slice(ffn_full, [BATCH_TILE, FFN_OUT_CHUNK], [0, 0])
                 wd0 = pl.load(w_down, [0, d0], [FFN_OUT_CHUNK, K_CHUNK], target_memory=pl.MemorySpace.Mat)
                 down_acc = pl.matmul(ffn0, wd0)
                 for ob in pl.range(1, FFN_OUT_BLOCKS):
                     o0 = ob * FFN_OUT_CHUNK
-                    ffn_i = pl.load(ffn_batch, [0, o0], [BATCH_TILE, FFN_OUT_CHUNK], target_memory=pl.MemorySpace.Mat)
+                    ffn_i = pl.slice(ffn_full, [BATCH_TILE, FFN_OUT_CHUNK], [0, o0])
                     wd_i = pl.load(w_down, [o0, d0], [FFN_OUT_CHUNK, K_CHUNK], target_memory=pl.MemorySpace.Mat)
                     down_acc = pl.matmul_acc(down_acc, ffn_i, wd_i)
                 out = pl.store(down_acc, [b0, d0], out)
