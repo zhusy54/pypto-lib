@@ -48,7 +48,7 @@ MAX_SEQ_LEN = M.max_position_embeddings
 
 # tiling
 Q_PROJ_TILE = 128       # qproj K-tile (Q_LORA reduction); 8 slices -> deep stage=2 pipeline, double-buffered Mat fits
-QPROJ_MM_N_TILE = 512    # qproj output-column tile
+QPROJ_MM_N_TILE = 256    # qproj output-column tile
 Q_LORA_TILE = 256       # qr rms-norm / quant N granularity (decoupled from qr_proj matmul)
 KV_TILE = 64            # kv rms-norm / rope / NOPE N granularity (decoupled from kv_proj matmul)
 QUANT_TILE = 256
@@ -62,13 +62,13 @@ MATMUL_T_TILE = 16
 QR_M_TILE = MATMUL_T_TILE  # qr_proj token (M) tile; cube rows must be a 16-row boxed tile
 QR_N_TILE = 128         # qr_proj Q_LORA (N) per matmul
 QR_K_TILE = 256         # qr_proj D (K) reduction tile    | divides QR_K_SLICE
-QR_OK = 2               # qr_proj split-K factor          | D//QR_OK cores share each N-group
-QR_K_SLICE = D // QR_OK # qr_proj K per split (=2048)     | QR_K_SLICE//QR_K_TILE inner chunks
+QR_OK = 8               # qr_proj split-K factor          | D//QR_OK cores share each N-group
+QR_K_SLICE = D // QR_OK # qr_proj K per split (=512)      | QR_K_SLICE//QR_K_TILE inner chunks
 KV_M_TILE = MATMUL_T_TILE  # kv_proj token (M) tile; decode pads from 8 real rows to 16
 KV_N_TILE = 128         # kv_proj HEAD_DIM (N) per matmul
 KV_K_TILE = 256         # kv_proj D (K) reduction tile    | divides KV_K_SLICE
-KV_OK = 4               # kv_proj split-K factor          | D//KV_OK cores share each N-group
-KV_K_SLICE = D // KV_OK # kv_proj K per split (=1024)     | KV_K_SLICE//KV_K_TILE inner chunks
+KV_OK = 8               # kv_proj split-K factor          | D//KV_OK cores share each N-group
+KV_K_SLICE = D // KV_OK # kv_proj K per split (=512)      | KV_K_SLICE//KV_K_TILE inner chunks
 QPROJ_M_TILE = MATMUL_T_TILE  # qproj token (M) tile; decode pads from 8 real rows to 16
 KV_RMS_T_TILE = 8       # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
@@ -769,7 +769,7 @@ def qkv_proj_rope(
     rope_prepare(rope_cos, rope_sin, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx)
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
-    # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
+    # eight N-groups; QR_OK=8 expands them to 64 cube blocks and atomic-adds the
     # K partials into a zero-seeded output. Auto-dep on qr_fp32 orders the seed
     # before every atomic RMW. Seeded on-core (not create_tensor init_value=0):
     # AICPU init serializes on the scheduler/orchestration path and roughly
@@ -905,9 +905,8 @@ def qkv_proj_rope(
                 q_rope_bf16 = pl.cast(q_rope_rot, target_type=pl.BF16, mode="rint")
                 q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = q_rope_bf16
 
-    # Split-K kv_proj uses four 128-column N-groups and KV_OK=4, again producing
-    # 16 cube blocks. KV is off the critical path, so more K splits only add atomic
-    # contention without shortening decode.
+    # Split-K kv_proj uses four 128-column N-groups and KV_OK=8, producing
+    # 32 cube blocks. KV is kept one dependency hop behind q_proj.
     kv_fp32 = pl.create_tensor([t_matmul, HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
         for tc in pl.range(t_matmul // KV_M_TILE):

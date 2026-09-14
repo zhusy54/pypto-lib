@@ -67,15 +67,14 @@ CACHE_TILE = 64
 assert BLOCK_SIZE % CACHE_TILE == 0, "CACHE_TILE must not cross a paged idx_kv_cache block"
 # One scheduler block covers 128 source tokens and stores 32 C4 rows.
 REDUCE_TILE = BLOCK_SIZE // COMPRESS_RATIO
-# the fused score scope fans the cache-page loop across REDUCE_NSPLIT extra lanes: T * NSPLIT.
-# T*NSPLIT=16 mixed blocks map to 16 AIC + 32 AIV (1:2), one clean wave on the 24+48 chip.
-REDUCE_NSPLIT = 2
+# The fused score scope fans the cache-page loop across REDUCE_NSPLIT extra lanes: T * NSPLIT.
+# T*NSPLIT=80 mixed blocks fan score reduction across the target machine.
+REDUCE_NSPLIT = 10
 Q_TILE = 256
 # Q_OUT_TILE is the per-task N granularity (sets idx_qr_proj task count); MM_N_TILE
-# is the Mat-safe cube N-tile. Q_OUT_TILE fans Q_OUT_TILE // MM_N_TILE cube ops per
-# task so task count halves without growing the [Q_TILE, MM_N_TILE] L1 wq load.
-Q_OUT_TILE = 1024
-MM_N_TILE = 512
+# is the Mat-safe cube N-tile. Each task covers Q_OUT_TILE // MM_N_TILE cube ops.
+Q_OUT_TILE = 256
+MM_N_TILE = 256
 MM_ROW_TILE = 16
 T_PAD = ((T + MM_ROW_TILE - 1) // MM_ROW_TILE) * MM_ROW_TILE
 # weights_proj is one 16-row boxed matmul per task; decode T fits in one row tile.
@@ -94,7 +93,7 @@ WEIGHTS_K_SLICE = D // WEIGHTS_OK
 assert WEIGHTS_K_SLICE % D_TILE == 0
 QH_QUANT_TILE = 64
 # cube tile for q @ hadamard; L0C caps it at QH_MM_TILE * IDX_HEAD_DIM * 4B <= 64KiB.
-QH_MM_TILE = 64
+QH_MM_TILE = 16
 QH_HEAD_DIM_TILE = 64
 ROPE_ROW_BLOCK = S * IDX_N_HEADS
 # qr_rope SPMD tile == row block: one ROPE_ROW_TILE-row block per SPMD tile.

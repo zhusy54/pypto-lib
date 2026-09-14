@@ -60,7 +60,7 @@ CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 # tiling
 ROPE_TILE = 32
 K_TILE = 512
-OUT_TILE = 64
+OUT_TILE = 16
 B_TILE = 8
 MM_B_TILE = 16
 BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE

@@ -66,12 +66,13 @@ CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # tiling
-H_TILE = 16
-QK_M_TILE = 32           # qk_pv M rows per QK/PV matmul; QK_M_TILE/H_TILE-way KV L1->L0 reuse
+QK_STORE_H_TILE = 16
+MERGE_H_TILE = 8
+QK_M_TILE = 32           # qk_pv M rows per QK/PV matmul
 ATTN_K_TILE = 128
-NUM_QK_CORES = 24        # qk_pv dispatch lanes = a2a3 AIC count; re-sweep for other AIC counts
+NUM_QK_CORES = 40        # qk_pv dispatch lanes
 A_K_TILE = 256           # proj_a cube K frag
-PROJ_A_MM_N_TILE = 128   # proj_a cube N frag
+PROJ_A_MM_N_TILE = 64    # proj_a cube N frag
 MM_T_TILE = 16
 T_PAD = ((T + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
 B_K_TILE = 256           # proj_b_mm cube K frag
@@ -81,7 +82,7 @@ PROJ_B_ACT_N_TILE = 512  # proj_b_act vector N frag
 # Fused amax+quant token tile. 8 keeps the [1, QUANT_TOKEN_TILE] fp32 amax tile
 # 32-byte aligned (8*4=32B, the alloc-tile row floor).
 QUANT_TOKEN_TILE = 8
-PROJ_B_D_TILE = 512      # proj_b_mm D chunk per task; its N frags loop inside the task
+PROJ_B_D_TILE = 256      # proj_b_mm D chunk per task; its N frags loop inside the task
 PROJ_B_ACT_T_TILE = 8    # proj_b_act inner token tile for the O_GROUPS-way INT32->FP32 accumulate
 PROJ_B_ACT_TASK_T_TILE = 8   # proj_b_act token block per task
 TOPK = WIN + CMP_TOPK
@@ -191,9 +192,15 @@ def sparse_attn_csa(
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
-    sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
-    sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
+    sparse_blk_mi = pl.create_tensor(
+        [T * (H // QK_STORE_H_TILE) * SPARSE_BLOCKS * QK_STORE_H_TILE, 1], dtype=pl.FP32
+    )
+    sparse_blk_li = pl.create_tensor(
+        [T * (H // QK_STORE_H_TILE) * SPARSE_BLOCKS * QK_STORE_H_TILE, 1], dtype=pl.FP32
+    )
+    sparse_blk_oi = pl.create_tensor(
+        [T * (H // QK_STORE_H_TILE) * SPARSE_BLOCKS * QK_STORE_H_TILE, HEAD_DIM], dtype=pl.FP32
+    )
 
     with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid], allow_early_resolve=True) as qk_tid:
         qk_core = pl.tile.get_block_idx()
@@ -207,7 +214,7 @@ def sparse_attn_csa(
             qk_t = qk_item // SPARSE_BLOCKS
             qk_sb = qk_item - qk_t * SPARSE_BLOCKS
             qk_b = qk_t // S
-            qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
+            qk_token_base = qk_t * (H // QK_STORE_H_TILE) * SPARSE_BLOCKS * QK_STORE_H_TILE
             qk_s0 = qk_sb * ATTN_K_TILE
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
             qk_block_valid = pl.read(valid_block_mask, [qk_t, qk_sb])
@@ -267,10 +274,7 @@ def sparse_attn_csa(
                     else:
                         qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
 
-                # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV tile
-                # is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles. The softmax
-                # result slices back into H_TILE-row stores at the same offsets as the
-                # per-head-tile path, keeping sparse_blk_* and merge_norm identical.
+                # Each QK/PV result is stored in cache-line-sized head groups.
                 for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
                     qk_h0 = qk_hb * QK_M_TILE
                     qk_head_row = qk_t * H + qk_h0
@@ -286,40 +290,49 @@ def sparse_attn_csa(
                     qk_li = pl.row_sum(qk_exp)
                     qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
                     qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
-                    for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
-                        qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
-                        qk_r0 = qk_sub * H_TILE
-                        qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
-                        qk_row = qk_blk_base + qk_sb * H_TILE
-                        sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                        sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                        sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
+                    for qk_sub in pl.unroll(QK_M_TILE // QK_STORE_H_TILE):
+                        qk_h_idx = qk_hb * (QK_M_TILE // QK_STORE_H_TILE) + qk_sub
+                        qk_r0 = qk_sub * QK_STORE_H_TILE
+                        qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * QK_STORE_H_TILE
+                        qk_row = qk_blk_base + qk_sb * QK_STORE_H_TILE
+                        sparse_blk_mi[qk_row : qk_row + QK_STORE_H_TILE, 0 : 1] = qk_mi[
+                            qk_r0 : qk_r0 + QK_STORE_H_TILE, 0 : 1
+                        ]
+                        sparse_blk_li[qk_row : qk_row + QK_STORE_H_TILE, 0 : 1] = qk_li[
+                            qk_r0 : qk_r0 + QK_STORE_H_TILE, 0 : 1
+                        ]
+                        sparse_blk_oi[qk_row : qk_row + QK_STORE_H_TILE, 0 : HEAD_DIM] = qk_oi[
+                            qk_r0 : qk_r0 + QK_STORE_H_TILE, 0 : HEAD_DIM
+                        ]
             else:
-                qk_oi_zero = pl.full([H_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                for qk_h_idx in pl.range(H // H_TILE):
-                    qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
-                    qk_row = qk_blk_base + qk_sb * H_TILE
-                    for qk_hr in pl.range(H_TILE):
-                        pl.write(sparse_blk_mi, [qk_row + qk_hr, 0], -3.0e38)
-                        pl.write(sparse_blk_li, [qk_row + qk_hr, 0], 0.0)
-                    sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi_zero
+                qk_mi_invalid_row = pl.full([1, QK_STORE_H_TILE], dtype=pl.FP32, value=-3.0e38)
+                qk_li_invalid_row = pl.full([1, QK_STORE_H_TILE], dtype=pl.FP32, value=0.0)
+                qk_mi_invalid = pl.reshape(qk_mi_invalid_row, [QK_STORE_H_TILE, 1])
+                qk_li_invalid = pl.reshape(qk_li_invalid_row, [QK_STORE_H_TILE, 1])
+                qk_oi_zero = pl.full([QK_STORE_H_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                for qk_h_idx in pl.range(H // QK_STORE_H_TILE):
+                    qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * QK_STORE_H_TILE
+                    qk_row = qk_blk_base + qk_sb * QK_STORE_H_TILE
+                    sparse_blk_mi[qk_row : qk_row + QK_STORE_H_TILE, 0 : 1] = qk_mi_invalid
+                    sparse_blk_li[qk_row : qk_row + QK_STORE_H_TILE, 0 : 1] = qk_li_invalid
+                    sparse_blk_oi[qk_row : qk_row + QK_STORE_H_TILE, 0 : HEAD_DIM] = qk_oi_zero
 
     # Head-invariant interleaved cos and sign-folded sin, built once per token.
     # The conjugate (inverse) rotation is out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j].
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    # j^1 lane-swap index for merge_norm's rotation gather. Shaped [H_TILE, ROPE_DIM]
+    # j^1 lane-swap index for merge_norm's rotation gather. Shaped [MERGE_H_TILE, ROPE_DIM]
     # because gather's index must match its source rows.
-    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
+    rope_swap_idx = pl.create_tensor([MERGE_H_TILE, ROPE_DIM], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True):
-        sw_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        sw_ones = pl.full([MERGE_H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         sw_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
         sw_col = pl.col_expand_mul(sw_ones, sw_idx_f)
         sw_dup_i32 = pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc")
         sw_dup_f = pl.cast(sw_dup_i32, target_type=pl.FP32)
         sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))                                           # j%2
         sw_swap_f = pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0))                             # j^1
-        rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(sw_swap_f, target_type=pl.INT32)
+        rope_swap_idx[0:MERGE_H_TILE, 0:ROPE_DIM] = pl.cast(sw_swap_f, target_type=pl.INT32)
 
         cs_ones = pl.full([T, ROPE_DIM], dtype=pl.FP32, value=1.0)
         cs_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
@@ -340,21 +353,24 @@ def sparse_attn_csa(
     # straight into o_packed's rope columns. with-form spmd so merge_tid can be an
     # explicit dep of the manual-scope proj_a tasks below.
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm") as merge_tid:
+    with pl.spmd(T * (H // MERGE_H_TILE), name_hint="merge_norm") as merge_tid:
         m_idx = pl.tile.get_block_idx()
-        m_t = m_idx // (H // H_TILE)
-        m_h_idx = m_idx - m_t * (H // H_TILE)
-        m_h0 = m_h_idx * H_TILE
-        m_blk_base = m_idx * SPARSE_BLOCKS * H_TILE
-        m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
-        m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
-        m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
+        m_t = m_idx // (H // MERGE_H_TILE)
+        m_h_idx = m_idx - m_t * (H // MERGE_H_TILE)
+        m_h0 = m_h_idx * MERGE_H_TILE
+        m_store_h_idx = m_h_idx // (QK_STORE_H_TILE // MERGE_H_TILE)
+        m_store_h_offset = (m_h_idx % (QK_STORE_H_TILE // MERGE_H_TILE)) * MERGE_H_TILE
+        m_token_base = m_t * (H // QK_STORE_H_TILE) * SPARSE_BLOCKS * QK_STORE_H_TILE
+        m_blk_base = m_token_base + m_store_h_idx * SPARSE_BLOCKS * QK_STORE_H_TILE + m_store_h_offset
+        m_mi = sparse_blk_mi[m_blk_base : m_blk_base + MERGE_H_TILE, 0 : 1]
+        m_li = sparse_blk_li[m_blk_base : m_blk_base + MERGE_H_TILE, 0 : 1]
+        m_oi = sparse_blk_oi[m_blk_base : m_blk_base + MERGE_H_TILE, 0 : HEAD_DIM]
 
         for m_sb in pl.pipeline(1, SPARSE_BLOCKS, stage=2):
-            m_row = m_blk_base + m_sb * H_TILE
-            m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-            m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-            m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+            m_row = m_blk_base + m_sb * QK_STORE_H_TILE
+            m_cur_mi = sparse_blk_mi[m_row : m_row + MERGE_H_TILE, 0 : 1]
+            m_cur_li = sparse_blk_li[m_row : m_row + MERGE_H_TILE, 0 : 1]
+            m_cur_oi = sparse_blk_oi[m_row : m_row + MERGE_H_TILE, 0 : HEAD_DIM]
             m_mi_new = pl.maximum(m_mi, m_cur_mi)
             m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
             m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
@@ -362,25 +378,25 @@ def sparse_attn_csa(
             m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
             m_mi = m_mi_new
 
-        n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+        n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + MERGE_H_TILE], [MERGE_H_TILE, 1])
         n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
         n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-        n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
+        n_full = pl.row_expand_div(m_oi, n_denom)[0 : MERGE_H_TILE, 0 : HEAD_DIM]
         n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
         # Inverse RoPE on this head-tile's fp32 rope segment. cos_il / sign*sin are
-        # head-invariant for token m_t, so col_expand them over the H_TILE head rows;
+        # head-invariant for token m_t, so col_expand them over the MERGE_H_TILE head rows;
         # rope_swap_idx (j^1) pairs the interleaved real/imag lanes. Rounded to bf16
         # to match the golden.
-        m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
+        m_rope = n_full[0 : MERGE_H_TILE, NOPE_DIM : HEAD_DIM]
         m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
         m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
-        m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[0:H_TILE, 0:ROPE_DIM])
+        m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[0:MERGE_H_TILE, 0:ROPE_DIM])
         m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
         n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
         n_full_bf16 = pl.concat(n_bf16[:, : NOPE_DIM], n_rope_bf16)
 
-        for n_hi in pl.unroll(H_TILE):
+        for n_hi in pl.unroll(MERGE_H_TILE):
             n_pack_row = ((m_h0 + n_hi) // HEADS_PER_GROUP) * T + m_t
             n_col = ((m_h0 + n_hi) % HEADS_PER_GROUP) * HEAD_DIM
             # Nope and inverse-RoPE halves concatenated on chip: one contiguous store.

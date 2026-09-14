@@ -118,8 +118,8 @@ XG_BLOCKS = 5
 # ── Scope 1b · Q / K / V projections — SPLIT-K + inner N/K tiling, SPMD style ──
 # Tiling: TM=16 (M = full batch, OM=1), TN=256 inner N sub-tile, TK=256 inner
 # K chunk. Outer: ON = 10 (Q) / 2 (K) / 2 (V) N-tiles of QKV_N_TILE=512 each
-# (= N_SUB=2 inner TN subtiles); OK=4 split-K slices of QKV_K_SLICE=1280 each
-# (= QKV_K_CHUNKS=5 inner TK chunks), atomic-added. Each projection is ONE
+# (= N_SUB=2 inner TN subtiles); OK=5 split-K slices of QKV_K_SLICE=1024 each
+# (= QKV_K_CHUNKS=4 inner TK chunks), atomic-added. Each projection is ONE
 # pl.spmd dispatch of ON*OK blocks; each block does N_SUB N-subtiles x
 # QKV_K_CHUNKS chunks and atomic-adds into a zero-seeded output. SPMD (not
 # pl.parallel + per-iter pl.at) keeps the split-K atomic-adds inside a SINGLE
@@ -133,8 +133,8 @@ N_SUB = QKV_N_TILE // TN  # 2 inner N-subtiles per outer N-tile
 Q_ON = HIDDEN // QKV_N_TILE  # 10 outer N-tiles (Q)
 KV_ON = KV_HIDDEN // QKV_N_TILE  # 2 outer N-tiles (K, V)
 QKV_OK = 5  # split-K slices (atomic-add)  # 5 -> QKV_K_SLICE=1024 = normed slab (1:1 partial-Q)
-QKV_K_SLICE = HIDDEN // QKV_OK  # 1280 K per split
-QKV_K_CHUNKS = QKV_K_SLICE // TK  # 5 inner TK chunks per split
+QKV_K_SLICE = HIDDEN // QKV_OK  # 1024 K per split
+QKV_K_CHUNKS = QKV_K_SLICE // TK  # 4 inner TK chunks per split
 
 # ── Scope 2 · native PyPTO paged attention ──
 SEQ_TILE = T.seq_tile
@@ -161,12 +161,11 @@ assert (K_RED_ROWS * 4) % 32 == 0, "K QK-norm reduction rows (K_RED_ROWS) must b
 
 # ── Scope 3a · out_proj (split-K × split-N, atomic-add into attn_proj_fp32) ──
 K_SPLITS_OUT = 5
-N_SPLITS_OUT = 10
+N_SPLITS_OUT = 20
 OUT_INNER_TK = 64
-OUT_TN = HIDDEN // N_SPLITS_OUT  # 512 output N per task
+OUT_TN = HIDDEN // N_SPLITS_OUT  # 256 output N per task
 OUT_TK = HIDDEN // K_SPLITS_OUT  # 1024 K per task
 OUT_N_SUB_K = OUT_TK // OUT_INNER_TK  # 16 inner K iters per task
-N_OUT_DIRECT_BLOCKS = 24
 
 # ── Scope 3b · residual + BF16 cast + RMS reduce ──
 K_CHUNK = 256  # inner pipe width for residual_rms_cast and post_rms_reduce
@@ -191,9 +190,6 @@ DOWN_ON = HIDDEN // DOWN_TN  # 5 output N-blocks
 K_SPLITS = INTERMEDIATE // DOWN_TN  # 17 K-slices per N-block
 N_SUB_K = DOWN_TN // DOWN_TK  # 16 inner K iters per task
 
-# ── Cross-stage wiring constraints ──
-N_PER_CAST_K = MLP_K_SLICE // OUT_TN  # 2
-
 # Geometry assertions — keep at the bottom so all constants are defined first.
 assert QKV_N_TILE % TN == 0, "TN must divide the outer N-tile"
 assert HIDDEN % QKV_N_TILE == 0 and KV_HIDDEN % QKV_N_TILE == 0, "QKV_N_TILE must divide Q and KV widths"
@@ -211,7 +207,6 @@ assert MLP_TN == DOWN_TN, "silu/down K-slice alignment requires MLP_TN == DOWN_T
 assert N_SPLITS_OUT * OUT_TN == HIDDEN
 assert K_SPLITS_OUT * OUT_TK == HIDDEN
 assert OUT_N_SUB_K * OUT_INNER_TK == OUT_TK
-assert N_PER_CAST_K * OUT_TN == MLP_K_SLICE
 assert GATE_UP_SPMD_N < MLP_ON
 
 
@@ -627,53 +622,17 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         # indexing requires a pl.array, not a Python list).
         gate_late_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
         up_late_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
-        out_tids = pl.array.create(N_SPLITS_OUT * K_SPLITS_OUT, pl.TASK_ID)
-
-        # 14e2635 critical-wave split: defer the first 26 tiles through an
-        # unflagged dummy, while the final 24 tiles are one SPMD dispatch
-        # directly gated by FAI.  The direct dispatch intentionally has no
-        # allow_early_resolve flag.
-        out_proj_dummy = pl.system.task_dummy(deps=[attn_done_tid])
-        N_OUT_DIRECT = N_SPLITS_OUT * K_SPLITS_OUT - N_OUT_DIRECT_BLOCKS
-        for out_idx in pl.parallel(0, N_OUT_DIRECT):
-            n_out_proj = out_idx // K_SPLITS_OUT
-            k_split_out = out_idx % K_SPLITS_OUT
-            n_op = n_out_proj * OUT_TN
-            k_op = k_split_out * OUT_TK
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="out_proj",
-                deps=[out_proj_dummy],
-            ) as out_tid:
-                out_c_acc = pl.create_tensor([BATCH_PAD, OUT_TN], dtype=pl.FP32)
-                for out_lk in pl.pipeline(0, OUT_N_SUB_K, stage=2):
-                    out_ks_off = out_lk * OUT_INNER_TK
-                    out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
-                    out_w_k = wo[
-                        layer_hidden_base + k_op + out_ks_off : layer_hidden_base
-                        + k_op
-                        + out_ks_off
-                        + OUT_INNER_TK,
-                        n_op : n_op + OUT_TN,
-                    ]
-                    out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k, init_cond=(out_lk == 0))
-                attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add)
-            out_tids[out_idx] = out_tid
-
         with pl.spmd(
-            N_OUT_DIRECT_BLOCKS,
+            N_SPLITS_OUT * K_SPLITS_OUT,
             name_hint="out_proj",
             deps=[attn_done_tid],
-        ) as out_proj_direct_tid:
-            out_idx = N_OUT_DIRECT + pl.get_block_idx()
+        ) as out_proj_tid:
+            out_idx = pl.get_block_idx()
             n_out_proj = out_idx // K_SPLITS_OUT
             k_split_out = out_idx % K_SPLITS_OUT
             n_op = n_out_proj * OUT_TN
             k_op = k_split_out * OUT_TK
-            # This peel is NOT foldable into init_cond: with a create_tensor
-            # accumulator ptoas rejects the region with "'pto.tmatmul' op expects
-            # dst to be in the acc address space". The pl.at out_proj above takes
-            # init_cond fine; only this pl.spmd copy does not.
+            # Initialize the accumulator with the first K fragment.
             out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
             out_w0 = wo[
                 layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN
@@ -691,29 +650,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 ]
                 out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k, init_cond=(out_lk == 0))
             attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add)
-        for _block in pl.unroll(N_OUT_DIRECT_BLOCKS):
-            out_tids[N_OUT_DIRECT + _block] = out_proj_direct_tid
-
         # Tiled residual + BF16 cast.
         for k_slice in pl.unroll(K_SPLITS_MLP):
             k_base = k_slice * MLP_K_SLICE
-            n_split_base = k_slice * N_PER_CAST_K
             with pl.at(
                 level=pl.Level.CORE_GROUP,
                 name_hint="residual_rms_cast",
                 allow_early_resolve=True,
-                deps=[
-                    out_tids[(n_split_base + 0) * K_SPLITS_OUT + 0],
-                    out_tids[(n_split_base + 0) * K_SPLITS_OUT + 1],
-                    out_tids[(n_split_base + 0) * K_SPLITS_OUT + 2],
-                    out_tids[(n_split_base + 0) * K_SPLITS_OUT + 3],
-                    out_tids[(n_split_base + 0) * K_SPLITS_OUT + 4],
-                    out_tids[(n_split_base + 1) * K_SPLITS_OUT + 0],
-                    out_tids[(n_split_base + 1) * K_SPLITS_OUT + 1],
-                    out_tids[(n_split_base + 1) * K_SPLITS_OUT + 2],
-                    out_tids[(n_split_base + 1) * K_SPLITS_OUT + 3],
-                    out_tids[(n_split_base + 1) * K_SPLITS_OUT + 4],
-                ],
+                deps=[out_proj_tid],
             ) as cast_tid_k:
                 for kb in pl.pipeline(MLP_K_SLICE // K_CHUNK, stage=2):
                     k0 = k_base + kb * K_CHUNK
@@ -736,7 +680,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             cast_tids[k_slice] = cast_tid_k
 
         # RMS reduction reads all of attn_proj_fp32.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="post_rms_reduce", deps=[out_tids]) as reduce_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="post_rms_reduce", deps=[out_proj_tid]) as reduce_tid:
             sq_sum = pl.full([1, BATCH_PAD], dtype=pl.FP32, value=0.0)
             for kb in pl.pipeline(HIDDEN // K_CHUNK, stage=2):
                 k0 = kb * K_CHUNK
