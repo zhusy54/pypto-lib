@@ -8,7 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 MoE FFN router (decode): RMSNorm + gate + topk + normalize."""
 
-
 import pypto.language as pl
 
 from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF,
@@ -40,13 +39,40 @@ D_TILE = 256
 ROW_PAD = 8
 FFN_REDUCE_TILE = D // ROW_PAD
 assert D % ROW_PAD == 0
-GATE_D_TILE = 2048
+GATE_D_TILE = 2048 if D % 2048 == 0 else 512
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
 QUANT_TILE = 256
-SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
+SCORE_PAD = 256 if N_EXPERTS <= 256 else 384
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
+
+
+if SCORE_PAD == 384:
+    @pl.jit.inline
+    def route_topk_row(
+        score_row: pl.Tensor[[1, 384], pl.FP32],
+        idx_init: pl.Tensor[[1, 384], pl.UINT32],
+    ) -> pl.Tensor[[1, TOPK_PAD], pl.INT32]:
+        sorted_32 = pl.sort32(score_row, idx_init)
+        sorted_64 = pl.mrgsort(sorted_32, block_len=64)
+        sorted_pairs = pl.mrgsort(
+            sorted_64[:, 0:256],
+            sorted_64[:, 256:512],
+            sorted_64[:, 512:768],
+        )
+        return pl.gather(sorted_pairs[:, 0:SORT_PAD], mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+else:
+    @pl.jit.inline
+    def route_topk_row(
+        score_row: pl.Tensor[[1, 256], pl.FP32],
+        idx_init: pl.Tensor[[1, 256], pl.UINT32],
+    ) -> pl.Tensor[[1, TOPK_PAD], pl.INT32]:
+        sorted_32 = pl.sort32(score_row, idx_init)
+        sorted_64 = pl.mrgsort(sorted_32, block_len=64)
+        sorted_pairs = pl.mrgsort(sorted_64[:, 0:256], sorted_64[:, 256:512])
+        return pl.gather(sorted_pairs[:, 0:SORT_PAD], mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+
 
 def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE):
     """Build a router body with fixed projection tiles for its workload."""
@@ -265,16 +291,13 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE):
                 # is rejected.
                 topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
                 # ptoas pto.tmrgsort requires src rows == 1; sort path iterates
-                # row-by-row. sort32: [1,256]→[1,512] (8 runs of 64). mrgsort
-                # format1 4-way: 8→2 runs of 256. format2 2-way: 2→1 run of 512.
+                # row-by-row.
+                sr_idx_init = pl.create_tensor([1, SCORE_PAD], dtype=pl.UINT32)
+                sr_index_range = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
+                sr_idx_init[:, :] = sr_index_range
                 for sr_tt in pl.range(GATE_T_TILE):
-                    sr_row = biased_scores_buf[t1 + sr_tt : t1 + sr_tt + 1, :]
-                    sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
-                    sr_sorted = pl.sort32(sr_row, sr_idx_init)
-                    sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
-                    sr_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
-                    sr_pairs = sr_sorted[:, 0:SORT_PAD]
-                    sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                    sr_row = pl.slice(biased_scores_buf, [1, SCORE_PAD], [t1 + sr_tt, 0])
+                    sr_i = route_topk_row(sr_row, sr_idx_init)
                     topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
                 # Batched gather; set_validshape+fillpad zeros the [TOPK, TOPK_PAD)
                 # tail so the normalize sum below sees only real TOPK entries.

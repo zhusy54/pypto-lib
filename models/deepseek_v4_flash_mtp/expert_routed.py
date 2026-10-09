@@ -35,7 +35,7 @@ D_OUT_TILE = 256
 QUANT_TILE = 512
 D_OUT_ACT_TILE = 512
 W2_INNER = 2
-W2_ACT_INNER = 8
+W2_ACT_INNER = 8 if D % (8 * D_OUT_ACT_TILE) == 0 else 2
 
 # A partial last tile would read and write the next expert's rows.
 assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"

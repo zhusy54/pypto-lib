@@ -237,6 +237,9 @@ PRO = DeepSeekV4Config(
 
 PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
+# Exercise the Flash MTP kernels with Pro model dimensions.
+FLASH = PRO
+
 
 # Deployment constants
 DECODE_BATCH = 4                  # B: requests per decode step

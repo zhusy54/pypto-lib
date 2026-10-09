@@ -43,9 +43,9 @@ MM_INTER_TILE = 256
 ACT_INTER_TILE = 1024
 D_OUT_TILE = 256
 # h_tile_i8 stores use a whole number of a2a3 512-byte L2 cache lines.
-QUANT_TILE = 2048
+QUANT_TILE = 2048 if MOE_INTER % 2048 == 0 else 1024
 D_OUT_TILE_ACT = 512
-W2_ACT_INNER = 8
+W2_ACT_INNER = 8 if D % (8 * D_OUT_TILE_ACT) == 0 else 2
 
 
 def _expert_shared(
