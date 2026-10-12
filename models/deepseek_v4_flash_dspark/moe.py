@@ -46,13 +46,15 @@ if EXPERTS_PER_RANK <= 0:
     raise ValueError(f"--experts-per-rank must be a positive integer (got {EXPERTS_PER_RANK})")
 config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=EXPERTS_PER_RANK * EP)
 config.EP = EP
-config.RECV_MAX = EP * config.MOE_TOKENS
+# Source lanes need active rows only; padding each lane to MOE_TOKENS would
+# push the Pro bs=180 gather output allocation past the runtime's int32 limit.
+config.RECV_MAX = ((EP * config.MOE_ACTIVE_TOKENS + 63) // 64) * 64
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-from config import FLASH as M, MOE_TOKENS, RECV_MAX
+from config import FLASH as M, MOE_ACTIVE_TOKENS, MOE_TOKENS, RECV_MAX
 from expert_routed import RECV_TILE, TILES_PER_EXPERT, expert_routed_tile
 from expert_shared import expert_shared
 from gate import gate
@@ -87,8 +89,8 @@ N_ROUTES = T * TOPK
 
 # recv_x/recv_aux laid out [expert, source, slot], flattened to
 # [N_LOCAL * RECV_MAX, D]. Lane (e, src, slot) flat row = e * RECV_MAX +
-# src * MAX_PER_SRC + slot. One source sends <= T rows to a local expert.
-MAX_PER_SRC = T
+# src * MAX_PER_SRC + slot. One source sends <= MOE_ACTIVE_TOKENS rows.
+MAX_PER_SRC = MOE_ACTIVE_TOKENS
 FP32_PER_CACHE_LINE = 16
 INT64_PER_CACHE_LINE = 8
 AUX_PAD = 8  # FP32 pack tile width (32 B min tile); cols: 0=scale 1=weight
@@ -1211,6 +1213,8 @@ def _build_tensor_specs(layer_id, num_tokens, routing, fixture_rounds):
     import torch
     from golden import ScalarSpec, TensorSpec
 
+    if not 0 <= num_tokens <= MAX_PER_SRC:
+        raise ValueError(f"num_tokens must be in [0, {MAX_PER_SRC}], got {num_tokens}")
     retain_round_axis = fixture_rounds is not None
     rounds = fixture_rounds if retain_round_axis else 1
 

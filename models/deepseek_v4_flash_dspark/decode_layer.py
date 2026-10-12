@@ -266,9 +266,9 @@ def _active_batch(start_pos):
 
 
 def _validate_active_tokens(active_tokens):
-    if active_tokens <= 0 or active_tokens > MOE_TOKENS:
+    if active_tokens <= 0 or active_tokens > config.MOE_ACTIVE_TOKENS:
         raise ValueError(
-            f"active token count must be in [1, {MOE_TOKENS}], got {active_tokens}",
+            f"active token count must be in [1, {config.MOE_ACTIVE_TOKENS}], got {active_tokens}",
         )
     if active_tokens % DECODE_SEQ != 0:
         raise ValueError(
@@ -2346,6 +2346,7 @@ def _active_owner_rows_compare(compare):
 
 def main():
     import argparse
+    from pathlib import Path
 
     from golden import (
         mapped_pool_ratio_allclose,
@@ -2395,8 +2396,8 @@ def main():
 
     if args.tp != TP_SIZE or args.ep != EP_SIZE:
         parser.error(f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}")
-    if args.skip_golden and args.golden_data:
-        parser.error("--skip-golden cannot be combined with --golden-data")
+    if args.skip_golden and args.golden_data and (Path(args.golden_data) / "out").is_dir():
+        parser.error("--skip-golden requires golden-data without out/")
     start_pos = _parse_start_pos(args.start_pos)
     num_tokens_per_owner = _parse_num_tokens_per_owner(args.num_tokens_per_owner)
     kind = attention_kind_for_layer(args.layer_id)
@@ -2596,7 +2597,7 @@ def main():
             enable_scope_stats=args.enable_scope_stats,
             log_level=args.log_level,
             ring_task_window=16_384,
-            ring_heap=1_073_741_824,
+            ring_heap=(1_073_741_824, 1_073_741_824, 4_294_967_296, 1_073_741_824),
             ring_dep_pool=131_072,
         ),
         rtol=1e-2,

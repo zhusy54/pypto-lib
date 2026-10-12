@@ -286,6 +286,7 @@ EP = 8    # expert-parallel world size (moe overrides it from --ep)
 
 # MoE constants
 MOE_TOKENS = DECODE_TOKENS // TP
+MOE_ACTIVE_TOKENS = MOE_TOKENS
 DECODE_RECV_MAX = DP * DECODE_TOKENS
 PREFILL_RECV_MAX = DP * PREFILL_TOKENS
 RECV_MAX = DECODE_RECV_MAX
@@ -297,7 +298,7 @@ def configure_pro_decode_layer(tp_size, batch_per_rank=180):
     global HCA_STATE_PHYSICAL_BLOCKS
     global CSA_STATE_BLOCKS_PER_REQUEST, CSA_STATE_PHYSICAL_BLOCKS
     global CSA_INNER_STATE_BLOCKS_PER_REQUEST, CSA_INNER_STATE_PHYSICAL_BLOCKS
-    global MOE_TOKENS, DECODE_RECV_MAX, RECV_MAX
+    global MOE_TOKENS, MOE_ACTIVE_TOKENS, DECODE_RECV_MAX, RECV_MAX
 
     # Leaf modules import FLASH and shape constants once, after this selection.
     FLASH = PRO
@@ -318,5 +319,6 @@ def configure_pro_decode_layer(tp_size, batch_per_rank=180):
     # Shared-expert tiles require a multiple of 64 token rows.
     local_tokens = batch_per_rank * DECODE_SEQ
     MOE_TOKENS = ((local_tokens + 63) // 64) * 64
+    MOE_ACTIVE_TOKENS = local_tokens
     DECODE_RECV_MAX = DP * DECODE_TOKENS
     RECV_MAX = DECODE_RECV_MAX

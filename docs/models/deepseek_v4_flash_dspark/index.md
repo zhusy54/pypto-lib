@@ -24,9 +24,10 @@ For 180 requests per rank at position 524288, use TP=1 and EP=2:
 python models/deepseek_v4_flash_dspark/decode_layer.py -p a2a3 --tp 1 --ep 2 -d 0,1 --start-pos "$(python -c 'print(",".join(["524288"] * 180))')" --skip-golden
 ```
 
-`--skip-golden` attempts the complete device layer while skipping the large
-CPU reference calculation and numerical comparison. Omit it to validate
-against the reference.
+`--skip-golden` runs the complete device layer while skipping the large CPU
+reference calculation and numerical comparison. Omit it to validate against
+the reference. A saved input-only fixture can be replayed with
+`--skip-golden --golden-data <data-dir>`.
 
 At TP=2, each rank replicates the compressed KV cache for both ranks' 180
 requests. Its 512K fixture exceeds a 64GB device once the index cache and MoE
@@ -39,11 +40,15 @@ Recomputing the MoE golden from the device's actual attention output shows that
 small attention differences are amplified through MoE; the composed numerical
 comparison remains an open validation issue.
 
-At 180 requests per rank, TP=1 and EP=2 pass shape checks and compilation,
-but the complete device run has not passed. The initial run exhausted the
-runtime dependency pool. After increasing that pool, all vector cores stalled
-in the MoE `dispatch_gather` kernel and the scheduler timed out. The cause of
-this large-batch runtime stall remains unresolved.
+At 180 requests per rank, TP=1 and EP=2 complete the device run with MTP=3
+and position 524288. The 720 active token rows use 768 MoE compute rows for
+tile alignment, while each MoE source lane reserves only 720 receive slots.
+The two-source receive capacity is rounded to 1472 rows per expert. Padding
+each source lane to 768 rows previously made one 16-output gather allocation
+2,158,411,008 bytes, beyond the runtime's signed 32-bit output-size limit;
+the smaller receive capacity makes it 2,070,183,168 bytes. The full layer also
+uses a 4 GiB ring 2 heap and a 131,072-entry dependency pool. This device
+run used `--skip-golden`, so it establishes execution, not numerical agreement.
 
 `DSPARK_SPEC_TOKENS = 7` still describes the separate DSpark drafter. The
 integrated drafter and full forward are outside this Pro CSA-layer validation;
