@@ -291,17 +291,23 @@ PREFILL_RECV_MAX = DP * PREFILL_TOKENS
 RECV_MAX = DECODE_RECV_MAX
 
 
-def configure_pro_decode_layer():
-    """Select Pro dimensions and MTP=3 for the standalone decode-layer process."""
-    global FLASH, DECODE_SEQ, DECODE_TOKENS, HCA_STATE_PHYSICAL_BLOCKS
+def configure_pro_decode_layer(tp_size, batch_per_rank=180):
+    """Select Pro dimensions, MTP=3, and local batch for the decode layer."""
+    global FLASH, TP, DECODE_BATCH, DECODE_SEQ, DECODE_TOKENS, KV_ORI_BLOCK_NUM
+    global HCA_STATE_PHYSICAL_BLOCKS
     global CSA_STATE_BLOCKS_PER_REQUEST, CSA_STATE_PHYSICAL_BLOCKS
     global CSA_INNER_STATE_BLOCKS_PER_REQUEST, CSA_INNER_STATE_PHYSICAL_BLOCKS
     global MOE_TOKENS, DECODE_RECV_MAX, RECV_MAX
 
     # Leaf modules import FLASH and shape constants once, after this selection.
     FLASH = PRO
+    TP = tp_size
+    DECODE_BATCH = batch_per_rank * TP
     DECODE_SEQ = 1 + MTP_SPEC_TOKENS
     DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
+    # SWA uses a request-local ring and is imported by the layer entry point.
+    swa_rows = PRO.sliding_window + DECODE_SEQ - 1
+    KV_ORI_BLOCK_NUM = DECODE_BATCH * ((swa_rows + BLOCK_SIZE - 1) // BLOCK_SIZE)
     HCA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * (
         (128 + DECODE_SEQ + C128_COMPRESSOR_BLOCK_SIZE - 1) // C128_COMPRESSOR_BLOCK_SIZE
     )
@@ -309,6 +315,8 @@ def configure_pro_decode_layer():
     CSA_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * CSA_STATE_BLOCKS_PER_REQUEST
     CSA_INNER_STATE_BLOCKS_PER_REQUEST = CSA_STATE_BLOCKS_PER_REQUEST
     CSA_INNER_STATE_PHYSICAL_BLOCKS = DECODE_BATCH * CSA_INNER_STATE_BLOCKS_PER_REQUEST
-    MOE_TOKENS = DECODE_TOKENS // TP
+    # Shared-expert tiles require a multiple of 64 token rows.
+    local_tokens = batch_per_rank * DECODE_SEQ
+    MOE_TOKENS = ((local_tokens + 63) // 64) * 64
     DECODE_RECV_MAX = DP * DECODE_TOKENS
     RECV_MAX = DECODE_RECV_MAX

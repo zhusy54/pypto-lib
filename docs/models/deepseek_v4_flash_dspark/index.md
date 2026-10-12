@@ -6,9 +6,10 @@ Only the independent `decode_layer.py` entry selects the `PRO` preset by
 default. It selects layer 2, including the complete 384-expert MoE. Its target
 verification width is `DECODE_SEQ = 4`: one current token and three MTP
 tokens. Pass two starting positions per rank to meet the current CSA
-eight-row projection tile. Position 524288 exercises a 512K context without
-allocating a 512K-long dense cache. Other entries in this directory retain
-their Flash and DSpark defaults.
+eight-row projection tile. The standalone layer now reserves 180 requests per
+rank by default, with 720 active token rows and 768 MoE rows after tile
+alignment. Position 524288 exercises a 512K context. Other entries in this
+directory retain their Flash and DSpark defaults.
 
 The Pro layer fixture uses a 384-column gate score buffer and Pro-compatible
 shared and routed expert tiles. Run the complete layer with:
@@ -17,13 +18,32 @@ shared and routed expert tiles. Run the complete layer with:
 python models/deepseek_v4_flash_dspark/decode_layer.py -p a2a3 --tp 2 --ep 2 -d 0,1 --start-pos 524288,524288
 ```
 
+For 180 requests per rank at position 524288, use TP=1 and EP=2:
+
+```bash
+python models/deepseek_v4_flash_dspark/decode_layer.py -p a2a3 --tp 1 --ep 2 -d 0,1 --start-pos "$(python -c 'print(",".join(["524288"] * 180))')" --skip-golden
+```
+
+`--skip-golden` attempts the complete device layer while skipping the large
+CPU reference calculation and numerical comparison. Omit it to validate
+against the reference.
+
+At TP=2, each rank replicates the compressed KV cache for both ranks' 180
+requests. Its 512K fixture exceeds a 64GB device once the index cache and MoE
+weights are included.
+
 This full-layer fixture currently compiles and executes, but its final MoE
 output does not meet the end-to-end golden tolerance. CSA state, caches, and
 attention output pass. Standalone gate and MoE checks pass at the Pro dimensions.
 Recomputing the MoE golden from the device's actual attention output shows that
 small attention differences are amplified through MoE; the composed numerical
-comparison remains an open validation issue. Batch 180 per rank has not been
-tested.
+comparison remains an open validation issue.
+
+At 180 requests per rank, TP=1 and EP=2 pass shape checks and compilation,
+but the complete device run has not passed. The initial run exhausted the
+runtime dependency pool. After increasing that pool, all vector cores stalled
+in the MoE `dispatch_gather` kernel and the scheduler timed out. The cause of
+this large-batch runtime stall remains unresolved.
 
 `DSPARK_SPEC_TOKENS = 7` still describes the separate DSpark drafter. The
 integrated drafter and full forward are outside this Pro CSA-layer validation;

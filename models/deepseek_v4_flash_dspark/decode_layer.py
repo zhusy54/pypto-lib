@@ -43,8 +43,7 @@ if EP_SIZE not in _EP_CHOICES:
 if EP_SIZE % TP_SIZE != 0:
     raise ValueError(f"EP={EP_SIZE} must be divisible by TP={TP_SIZE}")
 
-config.configure_pro_decode_layer()
-config.TP = TP_SIZE
+config.configure_pro_decode_layer(TP_SIZE)
 
 import decode_csa as csa
 import decode_hca as hca
@@ -194,10 +193,10 @@ def _validate_import_contract():
             raise ValueError(
                 f"{module.__name__} uses S={module.S}, expected S={DECODE_SEQ}",
             )
-        if module.T < MOE_TOKENS:
+        if module.T != config.DECODE_BATCH // TP_SIZE * DECODE_SEQ:
             raise ValueError(
-                f"{module.__name__} local capacity {module.T} is smaller than "
-                f"MoE capacity {MOE_TOKENS}",
+                f"{module.__name__} local capacity {module.T} does not match "
+                f"the configured batch and S={DECODE_SEQ}",
             )
         if module.MAX_SEQ_LEN != MODEL_CONFIG.max_position_embeddings:
             raise ValueError(
@@ -210,6 +209,8 @@ def _validate_import_contract():
             f"MoE froze EP={moe_module.EP}, N_RANKS={moe_module.N_RANKS}; "
             f"expected EP={EP_SIZE}",
         )
+    if MOE_TOKENS < config.DECODE_BATCH // TP_SIZE * DECODE_SEQ:
+        raise ValueError("MoE capacity is smaller than the attention token capacity")
     if MOE_TOKENS % DECODE_SEQ != 0:
         raise ValueError(
             f"MoE capacity {MOE_TOKENS} must be divisible by S={DECODE_SEQ}",
@@ -256,7 +257,7 @@ def tp_group_for_rank(rank):
 
 def _active_batch(start_pos):
     if start_pos is None or isinstance(start_pos, int):
-        return 1 if start_pos is not None else MOE_TOKENS // DECODE_SEQ
+        return 1 if start_pos is not None else min(MOE_TOKENS // DECODE_SEQ, config.DECODE_BATCH // TP_SIZE)
     if not isinstance(start_pos, (list, tuple)):
         raise TypeError("start_pos must be None, an int, or a list/tuple of ints")
     if not start_pos:
@@ -2385,6 +2386,7 @@ def main():
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--skip-golden", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--log-level", type=str, default=None)
@@ -2393,6 +2395,8 @@ def main():
 
     if args.tp != TP_SIZE or args.ep != EP_SIZE:
         parser.error(f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}")
+    if args.skip_golden and args.golden_data:
+        parser.error("--skip-golden cannot be combined with --golden-data")
     start_pos = _parse_start_pos(args.start_pos)
     num_tokens_per_owner = _parse_num_tokens_per_owner(args.num_tokens_per_owner)
     kind = attention_kind_for_layer(args.layer_id)
@@ -2577,7 +2581,7 @@ def main():
     result = run(
         fn=layer_fn,
         specs=specs,
-        golden_fn=golden_fn,
+        golden_fn=None if args.skip_golden else golden_fn,
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
@@ -2593,11 +2597,11 @@ def main():
             log_level=args.log_level,
             ring_task_window=16_384,
             ring_heap=1_073_741_824,
-            ring_dep_pool=16_384,
+            ring_dep_pool=131_072,
         ),
         rtol=1e-2,
         atol=1e-2,
-        compare_fn=compare_fn,
+        compare_fn=None if args.skip_golden else compare_fn,
     )
     if not result.passed:
         if result.error:
