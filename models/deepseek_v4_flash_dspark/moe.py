@@ -36,9 +36,11 @@ def _parse_int_argv(name, default):
 
 
 EP = _parse_int_argv("--ep", _EP_DEFAULT)
-# Capped by EP so the default density (32/rank) can't overflow the checkpoint's
-# 256 experts past EP8 -- gate.py's score buffers are fixed at that width.
-_EXPERTS_PER_RANK_DEFAULT = min(_CHECKPOINT_N_ROUTED_EXPERTS // 8, _CHECKPOINT_N_ROUTED_EXPERTS // EP)
+_EXPERTS_PER_RANK_DEFAULT = (
+    _CHECKPOINT_N_ROUTED_EXPERTS // EP
+    if config.FLASH.name == "pro"
+    else min(_CHECKPOINT_N_ROUTED_EXPERTS // 8, _CHECKPOINT_N_ROUTED_EXPERTS // EP)
+)
 EXPERTS_PER_RANK = _parse_int_argv("--experts-per-rank", _EXPERTS_PER_RANK_DEFAULT)
 if EXPERTS_PER_RANK <= 0:
     raise ValueError(f"--experts-per-rank must be a positive integer (got {EXPERTS_PER_RANK})")

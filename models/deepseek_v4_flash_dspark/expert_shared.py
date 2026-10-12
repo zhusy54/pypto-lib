@@ -52,7 +52,7 @@ ACT_INTER_TILE = 1024
 D_OUT_TILE = 256
 W2_INNER = 2
 # h_tile_i8 stores use a whole number of a2a3 512-byte L2 cache lines.
-QUANT_TILE = 2048
+QUANT_TILE = 2048 if MOE_INTER % 2048 == 0 else 1024
 D_OUT_TILE_ACT = 128
 W2_ACT_INNER = 8
 

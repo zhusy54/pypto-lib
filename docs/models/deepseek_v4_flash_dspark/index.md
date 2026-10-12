@@ -1,5 +1,36 @@
 # DeepSeek V4-Flash, DSpark point
 
+## Pro CSA layer validation
+
+Only the independent `decode_layer.py` entry selects the `PRO` preset by
+default. It selects layer 2, including the complete 384-expert MoE. Its target
+verification width is `DECODE_SEQ = 4`: one current token and three MTP
+tokens. Pass two starting positions per rank to meet the current CSA
+eight-row projection tile. Position 524288 exercises a 512K context without
+allocating a 512K-long dense cache. Other entries in this directory retain
+their Flash and DSpark defaults.
+
+The Pro layer fixture uses a 384-column gate score buffer and Pro-compatible
+shared and routed expert tiles. Run the complete layer with:
+
+```bash
+python models/deepseek_v4_flash_dspark/decode_layer.py -p a2a3 --tp 2 --ep 2 -d 0,1 --start-pos 524288,524288
+```
+
+This full-layer fixture currently compiles and executes, but its final MoE
+output does not meet the end-to-end golden tolerance. CSA state, caches, and
+attention output pass. Standalone gate and MoE checks pass at the Pro dimensions.
+Recomputing the MoE golden from the device's actual attention output shows that
+small attention differences are amplified through MoE; the composed numerical
+comparison remains an open validation issue. Batch 180 per rank has not been
+tested.
+
+`DSPARK_SPEC_TOKENS = 7` still describes the separate DSpark drafter. The
+integrated drafter and full forward are outside this Pro CSA-layer validation;
+the Flash deployment description below does not establish their Pro support.
+
+## Original Flash deployment design
+
 `models/deepseek_v4_flash_dspark/` is the second deployment point of the same
 V4-Flash checkpoint: a wide-batch serving configuration whose speculation comes
 from a **DSpark drafter** instead of one MTP layer, and whose attention is
@@ -222,7 +253,6 @@ entry its own fixture drives — so the composed and standalone forms cannot
 drift.
 
 ```bash
-python models/deepseek_v4_flash_dspark/decode_layer.py -p a2a3 --tp 2 --ep 2 -d 0,1
 python models/deepseek_v4_flash_dspark/decode_fwd.py -p a2a3 --tp 2 --ep 2 -d 0,1
 python models/deepseek_v4_flash_dspark/dspark_drafter.py -p a2a3 --tp 2 --ep 2 -d 0,1
 python models/deepseek_v4_flash_dspark/decode_fwd_dspark.py -p a2a3 --tp 2 --ep 2 -d 0,1

@@ -40,7 +40,11 @@ QUANT_ROW_TILE = 16
 QUANT_SCALE_PAD = 8
 D_OUT_TILE_ACT = 256
 W2_INNER = 1
-W2_ACT_INNER = 8
+W2_ACT_INNER = (
+    8 if D % (8 * D_OUT_TILE_ACT) == 0
+    else 4 if D % (4 * D_OUT_TILE_ACT) == 0
+    else 2
+)
 TILES_PER_EXPERT = RECV_MAX // RECV_TILE
 
 assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"

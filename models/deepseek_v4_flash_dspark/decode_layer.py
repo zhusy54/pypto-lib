@@ -43,6 +43,7 @@ if EP_SIZE not in _EP_CHOICES:
 if EP_SIZE % TP_SIZE != 0:
     raise ValueError(f"EP={EP_SIZE} must be divisible by TP={TP_SIZE}")
 
+config.configure_pro_decode_layer()
 config.TP = TP_SIZE
 
 import decode_csa as csa
@@ -2363,7 +2364,7 @@ def main():
         "-d", "--device", type=str, default=None,
         help=f"comma-separated device ids; EP={EP_SIZE} needs exactly {EP_SIZE}",
     )
-    parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--layer-id", type=int, default=2)
     parser.add_argument(
         "--start-pos", type=str, default=None,
         help=(
