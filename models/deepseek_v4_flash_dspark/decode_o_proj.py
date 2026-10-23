@@ -100,7 +100,9 @@ PROJ_B_MEDIUM_T_TILE = _token_tile(T_PAD, 96)
 PROJ_B_MM_N_TILE = 128 if PROJ_B_BALANCED_120 else 256
 PROJ_B_ACT_N_TILE = 512
 QUANT_TOKEN_TILE = 8
-QUANT_TASK_T_TILE = 32
+QUANT_TASK_T_TILE = (
+    48 if T_PAD == 720 and D == 7168 and O_GROUPS == 16 and O_LORA == 1024 else 32
+)
 PROJ_B_D_TILE = 896 if PROJ_B_BALANCED_120 else 512
 PROJ_B_ACT_T_TILE = 8
 PROJ_B_ACT_WORKERS = 120  # Redistribute complete 8-row output units.

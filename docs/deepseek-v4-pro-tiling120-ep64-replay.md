@@ -1,10 +1,11 @@
 # PRO CSA tiling experiment and EP64 compute replay
 
-This branch carries the measured tiling changes for
+This branch carries measured and subsequently revised tiling changes for
 `models/deepseek_v4_flash_dspark`, based on commit
 `c0438d4da04de477ad688b61ec3c338ce45e83a0`. The intended scheduling model has
 120 AIC and 120 AIV cores. Measurements were taken on A3 with 24 AIC and 48 AIV
-cores; they are not measurements on the target device.
+cores; they are not measurements on the target device. The quantization parameter
+revision below has not been compiled or executed on a device.
 
 ## Model changes
 
@@ -15,6 +16,8 @@ cores; they are not measurements on the target device.
 | CSA metadata and cache writeback | Cap workers at the number of independent existing token tiles. |
 | HcPost, FFN normalization, shared/routed combine | Distribute complete token rows across up to 120 workers, preserving each row's arithmetic and accumulation order. |
 | Shared experts | `SH_MM_BLOCKS`: 6 to 24; `W2_INNER`: 2 to 1; `W2_ACT_INNER`: 8 to 2. The later shared-expert commit sets `SH_M_TILE=96` and `SH_ROWS_PER_BLOCK=8`. |
+| TP1 output projection A | Restore the original 128-row by 256-channel partition and kernel structure: 24 blocks per call, 384 across 16 calls for the full PRO shape. |
+| TP1 output quantization | For `T_PAD=720`, `D=7168`, 16 output groups and rank 1024, assign 48 complete rows per worker while retaining the 8-row inner tile and full 1024-channel row reduction: 15 blocks per call, 240 across 16 calls. |
 | TP1 output projection B | For `T_PAD=720` and `D=7168`, use 48-row by 896-channel output regions: 15 by 8 gives 120 blocks per call. The inner N tile is 128; the complete K reduction stays within each block. |
 | Projection B epilogue | Redistribute complete 8-row by 512-channel units across at most 120 workers, preserving the 16-group accumulation order. |
 | Attention-to-MoE packing | Use at most 120 workers to copy active rows and zero padded rows. The SWA, HCA, and CSA bridges use the same partition; CSA was measured. |
@@ -22,10 +25,40 @@ cores; they are not measurements on the target device.
 
 The shared gate/up matmuls now use 24 blocks per call; shared W2 matmul and W2
 activation use 28 each. This does not force every task to have 120 blocks.
-Independent calls can execute concurrently. Projection A keeps its existing
-partition. Routed expert kernel tiling, mixed AIC/AIV protocols, compiler/runtime
+Independent calls can execute concurrently. Routed expert kernel tiling,
+mixed AIC/AIV protocols, compiler/runtime
 sources, and model defaults are unchanged. In particular, this branch does not
 change the default model EP setting to 64.
+
+## Quantization parameter revision and projection-A restoration
+
+Projection A retains its original 128-row by 256-channel partition:
+`ceil(720 / 128) * (1024 / 256) = 24` blocks per invocation, or 384 across
+16 groups. The additional worker-channel parameter and inner channel loop
+introduced in the previous revision have been removed, together with its
+48-row projection tile. Projection-A function signatures, call sites,
+computation and task organization match the pre-revision implementation.
+
+The only source difference from that implementation is the assignment to the
+existing `QUANT_TASK_T_TILE` parameter. It changes from 32 to 48 for the PRO
+TP1 shape with `T_PAD=720`, `D=7168`, 16 output groups and rank 1024; other
+configured shapes retain 32. Every kernel function body remains unchanged.
+For 720 active rows, `quant_1` uses 15 blocks per invocation and 240 across
+16 calls, instead of 23 per invocation and 368 total. These counts are derived
+from source and have not yet been verified in a new runtime capture.
+
+`QUANT_TOKEN_TILE` remains 8. Each block runs six iterations of the existing
+inner loop instead of at most four; there is no added loop or new compute
+path. The row maximum still covers all 1024 group channels. Scale calculation,
+epsilon floor, rounding, casts, output layout, tail zeroing, explicit task
+dependencies and early-resolve settings are unchanged. Static coverage checks
+confirm that all 720 active rows are handled exactly once.
+
+Compilation, numerical comparison and device execution of this parameter
+revision remain deferred. Static checks do not establish runtime accuracy or
+a speedup. Previous measured block durations, reports and headers must be
+regenerated after a fresh capture before evaluating the new quantization tile.
+Projection B, shared experts, packing and gate changes are retained.
 
 For the full PRO TP1 shape, projection B changes from 126 to 120 blocks per
 call (16 calls), its epilogue from 322 to 120, and attention packing from 768
