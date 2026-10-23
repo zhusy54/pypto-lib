@@ -47,14 +47,14 @@ assert SH_VALID_M % SH_ROWS_PER_BLOCK == 0
 K_TILE = 1024
 INTER_K = 512
 MM_INTER_TILE = 128
-SH_MM_BLOCKS = 6
+SH_MM_BLOCKS = 24
 ACT_INTER_TILE = 1024
 D_OUT_TILE = 256
-W2_INNER = 2
+W2_INNER = 1
 # h_tile_i8 stores use a whole number of a2a3 512-byte L2 cache lines.
 QUANT_TILE = 2048 if MOE_INTER % 2048 == 0 else 1024
 D_OUT_TILE_ACT = 128
-W2_ACT_INNER = 8
+W2_ACT_INNER = 2
 
 
 def _expert_shared(

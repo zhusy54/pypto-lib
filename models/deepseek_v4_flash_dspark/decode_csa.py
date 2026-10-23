@@ -190,7 +190,7 @@ CSA_ALL_VISIBLE_WORKERS = 16
 CSA_WB_TOKEN_TILE = 8
 CSA_ROPE_WORKERS = 16
 CSA_WB_WORKERS = 48  # CSA cache-write workers
-TP1_CSA_WB_WORKERS = 8  # TP1 CSA cache-write workers
+TP1_CSA_WB_WORKERS = 120  # TP1 CSA cache-write workers
 
 if T != LOCAL_T:
     raise ValueError(f"CSA token capacity {T} must equal TP local token capacity {LOCAL_T}")
@@ -889,9 +889,10 @@ def _decode_csa_tp1(
 
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        with pl.spmd(TP1_CSA_WB_WORKERS, name_hint="csa_cache_writeback"):
+        wb_workers = pl.min(wb_blocks, TP1_CSA_WB_WORKERS)
+        with pl.spmd(wb_workers, name_hint="csa_cache_writeback"):
             wb_worker = pl.tile.get_block_idx()
-            for wb_blk in pl.range(wb_worker, wb_blocks, TP1_CSA_WB_WORKERS):
+            for wb_blk in pl.range(wb_worker, wb_blocks, wb_workers):
                 wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
                 for write_dt in pl.range(CSA_WB_TOKEN_TILE):
                     write_t = wb_t0 + write_dt

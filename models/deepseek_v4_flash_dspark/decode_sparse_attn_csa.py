@@ -69,7 +69,7 @@ QK_PROB_READY_EVENT = 2
 QK_PV_READY_EVENT = 3
 ATTN_K_TILE = 128
 NUM_QK_CORES = 24  # qk_pv dispatch lanes
-CSA_PLAN_WORKERS = 16  # csa_slots_build_valid_qk_plan token-tile lanes
+CSA_PLAN_WORKERS = 120  # csa_slots_build_valid_qk_plan token-tile lanes
 T_PAD = ((T + 16 - 1) // 16) * 16  # Cube M floor
 ATTENTION_PUBLISH_WORKERS = 48
 ATTENTION_PUBLISH_T_TILE = 4
@@ -140,10 +140,11 @@ def _sparse_attn_csa(
     # Every token tile is independent: it reads its own idx_topk / position_ids /
     # window_swa_indices rows and writes its own cmp_sparse_indices, valid_block_mask
     # and sparse_bias rows, so the tiles spread over lanes instead of one core.
-    with pl.spmd(CSA_PLAN_WORKERS, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
+    plan_workers = pl.min(t_dim // BIAS_T_TILE, CSA_PLAN_WORKERS)
+    with pl.spmd(plan_workers, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
         plan_worker = pl.tile.get_block_idx()
         # Valid compressed slots.
-        for bias_t0 in pl.range(plan_worker * BIAS_T_TILE, t_dim, CSA_PLAN_WORKERS * BIAS_T_TILE):
+        for bias_t0 in pl.range(plan_worker * BIAS_T_TILE, t_dim, plan_workers * BIAS_T_TILE):
             c_raw = pl.cast(idx_topk[bias_t0 : bias_t0 + BIAS_T_TILE, 0:IDX_TOPK], target_type=pl.FP32)
             c_pos = pl.cast(position_ids[bias_t0 : bias_t0 + BIAS_T_TILE, 0:1], target_type=pl.FP32)
             c_pos_scaled = pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV)

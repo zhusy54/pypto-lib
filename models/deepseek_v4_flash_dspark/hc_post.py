@@ -28,6 +28,7 @@ HC_DIM = M.hc_dim
 
 # tiling
 T_TILE = 4
+POST_WORKERS = 120
 INACTIVE_FILL_T_TILE = 16
 INACTIVE_FILL_D_TILE = 256
 assert (DECODE_BATCH // TP * DECODE_SEQ) % T_TILE == 0
@@ -51,10 +52,11 @@ def _hc_post(
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, HC_DIM])
 
-    token_tiles = (t_dim + T_TILE - 1) // T_TILE
-    for token_block in pl.spmd(token_tiles, name_hint="hc_post"):
-        t0 = token_block * T_TILE
-        for t in pl.pipeline(t0, t0 + T_TILE, stage=2):
+    token_workers = pl.min(t_dim, POST_WORKERS)
+    for token_block in pl.spmd(token_workers, name_hint="hc_post"):
+        t0 = token_block * t_dim // token_workers
+        t_end = (token_block + 1) * t_dim // token_workers
+        for t in pl.pipeline(t0, t_end, stage=2):
             if t < t_dim:
                 # One cast per token: all HC_MULT outputs share the x row.
                 x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)

@@ -31,6 +31,7 @@ N_HASH_LAYERS = M.num_hash_layers
 # tiling
 T_TILE = 8
 NORM_TOKEN_TILE = 4
+NORM_WORKERS = 120
 GATE_T_TILE = 8
 GATE_M_TILE = 32        # cube M-tile: matmul rows must be a multiple of 16 (fractal)
 GATE_N_TILE = 32        # expert columns per gate spmd block
@@ -122,10 +123,11 @@ def _gate(
 
     # Each block normalizes a group of tokens with full-row reductions.
     norm_w_2d = pl.reshape(norm_w, [1, D])
-    norm_blocks = (active_gate_tokens + NORM_TOKEN_TILE - 1) // NORM_TOKEN_TILE
-    for tok_block in pl.spmd(norm_blocks, name_hint="ffn_norm", allow_early_resolve=True):
-        tok0 = tok_block * NORM_TOKEN_TILE
-        for tok in pl.range(tok0, pl.min(tok0 + NORM_TOKEN_TILE, active_gate_tokens)):
+    norm_workers = pl.min(active_gate_tokens, NORM_WORKERS)
+    for tok_block in pl.spmd(norm_workers, name_hint="ffn_norm", allow_early_resolve=True):
+        tok0 = tok_block * active_gate_tokens // norm_workers
+        tok_end = (tok_block + 1) * active_gate_tokens // norm_workers
+        for tok in pl.range(tok0, tok_end):
             rms_x = pl.cast(pl.tile.load(x_mixed, [tok, 0], [1, D]), pl.FP32)
             rms_w = pl.cast(pl.tile.load(norm_w_2d, [0, 0], [1, D]), pl.FP32)
             xg = pl.mul(rms_x, rms_w)

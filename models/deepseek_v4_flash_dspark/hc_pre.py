@@ -36,14 +36,14 @@ HC_PAD = 8  # hc (4) padded for 32B-aligned vector ops
 T_TILE = 8  # other values miscompare
 LINEAR_T_TILE = 16  # cube matmul rows must be a 16-row boxed tile
 COMB_T_TILE = 8
-PRE_POST_WORKERS = 16
+PRE_POST_WORKERS = 120
 RMS_K_TILE = 512
 LINEAR_K_TILE = 256
 D_TILE = 256
 D_SPMD = gcd(4096, D)
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
-LINEAR_WORKERS = 24  # hc_pre_linear workers, one per AIC
+LINEAR_WORKERS = 120  # hc_pre_linear workers, one per AIC
 
 # pre0..pre3 / row0..row3 are hand-unrolled over the hc lanes.
 assert HC_MULT == 4, f"hc_pre is specialized to HC_MULT == 4, got {HC_MULT}"

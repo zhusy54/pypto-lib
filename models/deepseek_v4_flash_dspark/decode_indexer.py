@@ -76,15 +76,15 @@ WEIGHTS_OK = 4  # Weights-projection K tile count
 WEIGHTS_K_TILE = D // WEIGHTS_OK
 D_TILE = gcd(512, WEIGHTS_K_TILE)
 QH_QUANT_TILE = 64
-QH_QUANT_WORKERS = 48  # Query Hadamard quantization workers
-QR_PROJ_WORKERS = 24  # Query projection workers
+QH_QUANT_WORKERS = 120  # Query Hadamard quantization workers
+QR_PROJ_WORKERS = 120  # Query projection workers
 QH_MM_TILE = 64  # Query Hadamard cube tile
-QH_WORKERS = 24  # Query Hadamard matmul workers
+QH_WORKERS = 120  # Query Hadamard matmul workers
 WEIGHTS_WORKERS = 24  # Weights-projection workers
-TP1_WEIGHTS_WORKERS = 8  # TP1 weights-projection workers
+TP1_WEIGHTS_WORKERS = 120  # TP1 weights-projection workers
 QH_HEAD_DIM_TILE = 64
 DQ_ROPE_H_TILE = 4  # heads per fused query dequant + RoPE unit
-DQ_ROPE_WORKERS = 48  # fused query dequant + RoPE workers
+DQ_ROPE_WORKERS = 120  # fused query dequant + RoPE workers
 TOPK_PAIR_WIDTH = 2 * IDX_TOPK
 
 # Top-K geometry.
@@ -94,7 +94,7 @@ TOPK_MAX_LEAVES = (
     TOPK_MAX_CANDIDATES + TOPK_CANDIDATES_PER_LEAF - 1
 ) // TOPK_CANDIDATES_PER_LEAF
 TOPK_ROWS_PER_QUERY = TOPK_MAX_LEAVES * 2
-TOPK_QUERY_WORKERS = 48  # Top-K query-merge workers
+TOPK_QUERY_WORKERS = 120  # Top-K query-merge workers
 TOPK_ARENA_ROWS = T_PAD * TOPK_ROWS_PER_QUERY
 TOPK_SCORE_WORKERS = 24  # Top-K score workers
 SCORE_TILE = 256
@@ -898,15 +898,16 @@ def indexer_qr_rope(
         # Weight reads bypass L2.
         pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
         qr_proj_worker = pl.tile.get_block_idx()
-        for qr_col in pl.range(qr_proj_worker, IDX_N_HEADS * IDX_HEAD_DIM // QR_MM_N_TILE, QR_PROJ_WORKERS):
+        for qr_unit in pl.range(qr_proj_worker, row_blocks * (IDX_N_HEADS * IDX_HEAD_DIM // QR_MM_N_TILE), QR_PROJ_WORKERS):
+            qr_rb = qr_unit // (IDX_N_HEADS * IDX_HEAD_DIM // QR_MM_N_TILE)
+            qr_col = qr_unit % (IDX_N_HEADS * IDX_HEAD_DIM // QR_MM_N_TILE)
             o_base = qr_col * QR_MM_N_TILE
             wq_tile = wq_b[0:Q_LORA, o_base : o_base + QR_MM_N_TILE]
-            for qr_rb in pl.range(row_blocks):
-                qr_r0 = qr_rb * QR_MM_ROW_TILE
-                qr_rows = pl.min(QR_MM_ROW_TILE, bs - qr_r0)
-                qr_tile = pl.slice(qr, [QR_MM_ROW_TILE, Q_LORA], [qr_r0, 0], valid_shape=[qr_rows, Q_LORA])
-                qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-                qr_acc_pad[qr_r0 : qr_r0 + QR_MM_ROW_TILE, o_base : o_base + QR_MM_N_TILE] = qr_acc
+            qr_r0 = qr_rb * QR_MM_ROW_TILE
+            qr_rows = pl.min(QR_MM_ROW_TILE, bs - qr_r0)
+            qr_tile = pl.slice(qr, [QR_MM_ROW_TILE, Q_LORA], [qr_r0, 0], valid_shape=[qr_rows, Q_LORA])
+            qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
+            qr_acc_pad[qr_r0 : qr_r0 + QR_MM_ROW_TILE, o_base : o_base + QR_MM_N_TILE] = qr_acc
     # Fused dequant + RoPE: one unit is DEQUANT_T_TILE tokens x DQ_ROPE_H_TILE heads.
     qr_bf16_2d = pl.reshape(qr_bf16, [T_PAD, IDX_N_HEADS * IDX_HEAD_DIM])
     dq_rope_units = (bs // DEQUANT_T_TILE) * (IDX_N_HEADS // DQ_ROPE_H_TILE)

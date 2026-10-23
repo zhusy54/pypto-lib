@@ -66,8 +66,8 @@ KV_OK = 4  # kv_proj split-K factor         | D//KV_OK cores share each N-group
 KV_OM = 3  # maximum kv_proj split-M factor
 KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=1024)
 QPROJ_M_TILE = 64  # dense qproj token tile; 64 KiB L0C accumulator
-# qproj_matmul runs on persistent workers, one per physical AIC.
-QPROJ_WORKERS = 24
+# qproj_matmul distributes output columns over persistent workers.
+QPROJ_WORKERS = 120
 QPROJ_TAIL_M_TILE = 64
 # Staging rows for the qr -> qproj handoff: a dense tile is capped at
 # PREFILL_DENSE_TILE rows, so this bounds qproj_t_matmul for every caller.
@@ -77,7 +77,7 @@ Q_ROPE_T_TILE = 8
 # q_rope_prepare runs on persistent workers, capped at the tile count so the
 # short call sites do not dispatch more blocks than they have work.
 Q_ROPE_WORKERS = 16
-QR_NORM_WORKERS = 16
+QR_NORM_WORKERS = 120
 Q_ROPE_H_TILE = 4  # heads per fused qproj dequant/rms/rope task
 Q_DEQUANT_WORKERS = 48
 assert QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap

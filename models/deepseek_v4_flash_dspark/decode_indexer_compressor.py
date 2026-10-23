@@ -71,9 +71,9 @@ OUT_TILE = 64
 PROJ_OUT_TILE = 32
 assert PROJ_OUT_TILE % 16 == 0, "cube tile cols must be a multiple of 16"
 MM_B_TILE = 16
-KV_SCORE_WORKERS = 24  # KV-score projection workers
-POOL_WORKERS = 16  # Pool workers
-RMS_WORKERS = 2  # RMSNorm + RoPE workers
+KV_SCORE_WORKERS = 120  # KV-score projection workers
+POOL_WORKERS = 120  # Pool workers
+RMS_WORKERS = 120  # RMSNorm + RoPE workers
 COMMIT_WORKERS = 16
 GROUP_BS = DECODE_BATCH * DECODE_SEQ
 BS_PAD = ((GROUP_BS + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE

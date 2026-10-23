@@ -102,6 +102,7 @@ IDX_PAD = 8  # INT32 route tile width; route rides a separate window from scale/
 # tiling
 PREFILL_INPUT_ID_TILE = 4
 COMBINE_TOKEN_TILE = 4
+COMBINE_WORKERS = 120
 
 # Scalar stores into recv_* land a whole 64-byte line at a time, so an expert
 # row and a token block must each own whole lines.
@@ -400,9 +401,12 @@ def combine(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    with pl.spmd(T // COMBINE_TOKEN_TILE, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
-        t0 = pl.tile.get_block_idx() * COMBINE_TOKEN_TILE
-        for t in pl.range(t0, t0 + COMBINE_TOKEN_TILE):
+    combine_workers = pl.min(T, COMBINE_WORKERS)
+    with pl.spmd(combine_workers, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
+        worker = pl.tile.get_block_idx()
+        t0 = worker * T // combine_workers
+        t_end = (worker + 1) * T // combine_workers
+        for t in pl.range(t0, t_end):
             if t < active_tokens:
                 acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
                 for k in pl.range(TOPK):
