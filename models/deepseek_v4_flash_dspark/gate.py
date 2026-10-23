@@ -34,7 +34,8 @@ NORM_TOKEN_TILE = 4
 NORM_WORKERS = 120
 GATE_T_TILE = 8
 GATE_M_TILE = 32        # cube M-tile: matmul rows must be a multiple of 16 (fractal)
-GATE_N_TILE = 32        # expert columns per gate spmd block
+GATE_N_TILE = 32        # Expert columns per compute tile.
+GATE_WORKERS = 240      # Retain complete tiles and the mixed-lane protocol.
 assert N_EXPERTS % GATE_N_TILE == 0
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 D_TILE = 256
@@ -211,34 +212,37 @@ def _gate(
     # GATE_N_TILE] slice on its own core; token-tile is the dynamic dim, so it
     # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
-    for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
-        # Weight reads bypass L2.
+    gate_units = active_gate_tiles * GATE_N_BLOCKS
+    gate_workers = pl.min(gate_units, GATE_WORKERS)
+    for gate_worker in pl.spmd(gate_workers, name_hint="gate", allow_early_resolve=True):
+        # Weight reads bypass L2 for every work unit in this scope.
         pl.set_cache_policy(gate_w, pl.CachePolicy.BYPASS)
-        tg = gb_idx // GATE_N_BLOCKS
-        nb = gb_idx % GATE_N_BLOCKS
-        t1 = tg * GATE_M_TILE
-        n0 = nb * GATE_N_TILE
-        gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
-        gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
-            gd_kd = kb * GATE_D_TILE
-            gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
-            gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True, init_cond=(gd_kd == 0))
-        # xg omitted inv_rms; logits = inv_rms * (xg @ gate_w.T). Per-token row-scale.
-        gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_buf[t1 : t1 + GATE_M_TILE, 0:1])
-        gp_relu = pl.maximum(gate_logits_tile, 0.0)
-        gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
-        gp_softplus_log = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
-        gp_neg_floor_mask = pl.minimum(pl.maximum(pl.sub(pl.neg(gate_logits_tile), 10.0), 0.0), 1.0)
-        gp_neg_floor = pl.mul(gp_neg_floor_mask, pl.exp(pl.minimum(gate_logits_tile, 0.0)))
-        gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
-        gp_score = pl.sqrt(gp_softplus)
-        route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
-        if layer_id >= N_HASH_LAYERS:
-            gp_bias = pl.col_expand_mul(pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=1.0), gp_bias_row)
-            gp_biased = pl.add(gp_score, gp_bias)
-            biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
+        for gb_idx in pl.range(gate_worker, gate_units, GATE_WORKERS):
+            tg = gb_idx // GATE_N_BLOCKS
+            nb = gb_idx % GATE_N_BLOCKS
+            t1 = tg * GATE_M_TILE
+            n0 = nb * GATE_N_TILE
+            gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
+            gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
+                gd_kd = kb * GATE_D_TILE
+                gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True, init_cond=(gd_kd == 0))
+            # xg omitted inv_rms; logits = inv_rms * (xg @ gate_w.T). Per-token row-scale.
+            gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_buf[t1 : t1 + GATE_M_TILE, 0:1])
+            gp_relu = pl.maximum(gate_logits_tile, 0.0)
+            gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
+            gp_softplus_log = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
+            gp_neg_floor_mask = pl.minimum(pl.maximum(pl.sub(pl.neg(gate_logits_tile), 10.0), 0.0), 1.0)
+            gp_neg_floor = pl.mul(gp_neg_floor_mask, pl.exp(pl.minimum(gate_logits_tile, 0.0)))
+            gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
+            gp_score = pl.sqrt(gp_softplus)
+            route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
+            if layer_id >= N_HASH_LAYERS:
+                gp_bias = pl.col_expand_mul(pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=1.0), gp_bias_row)
+                gp_biased = pl.add(gp_score, gp_bias)
+                biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
 
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # PyPTO cannot launch an SPMD task with zero blocks.  The guarded store in

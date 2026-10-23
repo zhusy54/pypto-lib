@@ -65,6 +65,7 @@ from moe import clear_moe_signals, moe
 MODEL_CONFIG = config.FLASH
 DECODE_SEQ = config.DECODE_SEQ
 MOE_TOKENS = moe_module.T
+ATTN_PACK_WORKERS = min(MOE_TOKENS, 120)
 TP_GROUPS = EP_SIZE // TP_SIZE
 MAX_PUBLIC_TENSOR_DIMS = 5
 
@@ -537,13 +538,15 @@ def decode_layer_swa(
 
     with pl.scope():
         x_attn_moe = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_attn_pack"):
-            if token < owner_tokens:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
-                    x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
-                )
-            else:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+        # Preserve every active row and padded row with fewer dispatch blocks.
+        for pack_worker in pl.spmd(ATTN_PACK_WORKERS, name_hint="decode_layer_attn_pack"):
+            for token in pl.range(pack_worker, MOE_TOKENS, ATTN_PACK_WORKERS):
+                if token < owner_tokens:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
+                        x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                    )
+                else:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
         moe(
             x_attn_moe,
@@ -932,13 +935,15 @@ def decode_layer_hca(
 
     with pl.scope():
         x_attn_moe = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_attn_pack"):
-            if token < owner_tokens:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
-                    x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
-                )
-            else:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+        # Preserve every active row and padded row with fewer dispatch blocks.
+        for pack_worker in pl.spmd(ATTN_PACK_WORKERS, name_hint="decode_layer_attn_pack"):
+            for token in pl.range(pack_worker, MOE_TOKENS, ATTN_PACK_WORKERS):
+                if token < owner_tokens:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
+                        x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                    )
+                else:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
         moe(
             x_attn_moe,
@@ -1413,13 +1418,15 @@ def decode_layer_csa(
 
     with pl.scope():
         x_attn_moe = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-        for token in pl.spmd(MOE_TOKENS, name_hint="decode_layer_attn_pack"):
-            if token < owner_tokens:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
-                    x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
-                )
-            else:
-                x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+        # Preserve every active row and padded row with fewer dispatch blocks.
+        for pack_worker in pl.spmd(ATTN_PACK_WORKERS, name_hint="decode_layer_attn_pack"):
+            for token in pl.range(pack_worker, MOE_TOKENS, ATTN_PACK_WORKERS):
+                if token < owner_tokens:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = (
+                        x_attn_active[token : token + 1, 0 : HC_MULT, 0 : D]
+                    )
+                else:
+                    x_attn_moe[token : token + 1, 0 : HC_MULT, 0 : D] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
 
         moe(
             x_attn_moe,

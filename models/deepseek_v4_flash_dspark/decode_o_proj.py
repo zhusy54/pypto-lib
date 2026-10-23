@@ -92,16 +92,18 @@ PROJ_A_LARGE_N_TILE = 256
 PROJ_A_ROW_TILE = 128  # proj_a token block; one block covers T_PAD, 8 tasks/group
 B_K_TILE = 256
 # Keep the INT32 proj-b accumulator within the A2/A3 tile buffer.
-PROJ_B_MM_T_TILE = _token_tile(T_PAD, 128)
+# Use an even 15 x 8 partition for the full PRO decode shape.
+PROJ_B_BALANCED_120 = T_PAD == 720 and D == 7168
+PROJ_B_MM_T_TILE = 48 if PROJ_B_BALANCED_120 else _token_tile(T_PAD, 128)
 PROJ_B_SMALL_T_TILE = _token_tile(T_PAD, 32)
 PROJ_B_MEDIUM_T_TILE = _token_tile(T_PAD, 96)
-PROJ_B_MM_N_TILE = 256
+PROJ_B_MM_N_TILE = 128 if PROJ_B_BALANCED_120 else 256
 PROJ_B_ACT_N_TILE = 512
 QUANT_TOKEN_TILE = 8
 QUANT_TASK_T_TILE = 32
-PROJ_B_D_TILE = 512  # proj_b_mm D chunk per task; coarser starves the 24 AIC cores
+PROJ_B_D_TILE = 896 if PROJ_B_BALANCED_120 else 512
 PROJ_B_ACT_T_TILE = 8
-PROJ_B_ACT_TASK_T_TILE = 32  # proj_b_act token block per task
+PROJ_B_ACT_WORKERS = 120  # Redistribute complete 8-row output units.
 
 # TP-sharded output projection tiling
 O_A_T_TILE = 128
@@ -144,6 +146,8 @@ if LOCAL_T_PAD % O_B_T_TILE != 0:
     raise ValueError(f"O-B token tile {O_B_T_TILE} must divide local token capacity {LOCAL_T_PAD}")
 if GROUP_T_PAD % O_B_T_TILE != 0:
     raise ValueError(f"O-B token tile {O_B_T_TILE} must divide token capacity {GROUP_T_PAD}")
+if D % PROJ_B_D_TILE != 0 or PROJ_B_D_TILE % PROJ_B_MM_N_TILE != 0:
+    raise ValueError("Local O-B output tiles must divide the hidden dimension")
 if T_PAD % PROJ_B_MM_T_TILE != 0:
     raise ValueError(
         f"proj_b_mm token tile {PROJ_B_MM_T_TILE} must divide token capacity {T_PAD}"
@@ -163,7 +167,9 @@ def _decode_o_proj_tp1_tiled(
 ):
     """Project local-token, full-group attention heads into BF16 hidden rows."""
     t_dim = pl.tensor.dim(attn_out, 0)
-    act_t_blks = (t_dim + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
+    act_row_units = (t_dim + PROJ_B_ACT_T_TILE - 1) // PROJ_B_ACT_T_TILE
+    act_units = act_row_units * (D // PROJ_B_ACT_N_TILE)
+    act_workers = pl.min(act_units, PROJ_B_ACT_WORKERS)
     proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
     proj_b_t_rows = (t_dim + ROW_TILE - 1) // ROW_TILE
     proj_b_padded_rows = proj_b_t_rows * ROW_TILE
@@ -272,16 +278,16 @@ def _decode_o_proj_tp1_tiled(
     # proj_b_act sums the O_GROUPS INT32 partials -- each dequantized by its group's
     # per-row act scale -- then applies the per-channel weight scale -> BF16. Explicit
     # deps on all proj_b_mm tasks bridge manual_scope -> the return's auto-dep.
-    with pl.spmd(act_t_blks * (D // PROJ_B_ACT_N_TILE), name_hint="proj_b_act",
+    with pl.spmd(act_workers, name_hint="proj_b_act",
                  deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
-        act_idx = pl.tile.get_block_idx()
-        tblk = act_idx // (D // PROJ_B_ACT_N_TILE)  # token block outermost
-        nreg = act_idx - tblk * (D // PROJ_B_ACT_N_TILE)
-        ob_n0 = nreg * PROJ_B_ACT_N_TILE
-        t0 = tblk * PROJ_B_ACT_TASK_T_TILE
-        wb_scale = wo_b_scale[ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE]
-        wb_scale_chunk = pl.reshape(wb_scale, [1, PROJ_B_ACT_N_TILE])
-        for b_tb in pl.range(t0, pl.min(t0 + PROJ_B_ACT_TASK_T_TILE, t_dim), PROJ_B_ACT_T_TILE):
+        act_worker = pl.tile.get_block_idx()
+        for act_unit in pl.range(act_worker, act_units, PROJ_B_ACT_WORKERS):
+            tblk = act_unit // (D // PROJ_B_ACT_N_TILE)
+            nreg = act_unit % (D // PROJ_B_ACT_N_TILE)
+            ob_n0 = nreg * PROJ_B_ACT_N_TILE
+            b_tb = tblk * PROJ_B_ACT_T_TILE
+            wb_scale = wo_b_scale[ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE]
+            wb_scale_chunk = pl.reshape(wb_scale, [1, PROJ_B_ACT_N_TILE])
             acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
             for act_g in pl.pipeline(O_GROUPS, stage=2):
                 p_col0 = act_g * D + ob_n0
